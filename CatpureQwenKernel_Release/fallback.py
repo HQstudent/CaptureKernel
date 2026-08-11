@@ -105,23 +105,33 @@ def fallback(func: Callable) -> Callable:
     return wrapper
 
 def _to_py(value):
-    """Convert torch SymInt/SymFloat/SymBool to plain Python types."""
+    """Convert torch SymInt/SymFloat/SymBool to plain Python types.
+    Falls back to str() when a symbolic value cannot be concretized (e.g. during
+    lazy module initialization before shapes are resolved).
+    """
     if hasattr(torch, "SymInt") and isinstance(value, torch.SymInt):
-        return int(value)
+        try:
+            return int(value)
+        except RuntimeError:
+            return str(value)
     if hasattr(torch, "SymFloat") and isinstance(value, torch.SymFloat):
-        return float(value)
+        try:
+            return float(value)
+        except RuntimeError:
+            return str(value)
     if hasattr(torch, "SymBool") and isinstance(value, torch.SymBool):
-        return bool(value)
+        try:
+            return bool(value)
+        except RuntimeError:
+            return str(value)
     return value
-
-
 def _safe_json_value(value):
     value = _to_py(value)
     if isinstance(value, torch.Tensor):
         return {
             "data_type": str(value.dtype),
-            "shape": [int(d) for d in value.shape],
-            "stride": [int(s) for s in value.stride()],
+            "shape": [_to_py(d) for d in value.shape],
+            "stride": [_to_py(s) for s in value.stride()],
         }
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
@@ -221,6 +231,7 @@ def register_fallback_ops():
         'not': True,
         '__invert__': True,
         'randn': True,
+        'scaled_dot_product_attention': True,
     }
     missing_ops = []
     for func_name, enabled in torch_functions.items():
@@ -235,27 +246,22 @@ def register_fallback_ops():
             origin_func = getattr(torch.Tensor, func_name)
             ops_dict[f'Tensor.{func_name}'] = torch_tensor_func_wrapper(origin_func, func_name)
             found = True
-        # Also check torch.nn.functional (always, even if found in torch — they can be different references)
-        if hasattr(torch.nn.functional, func_name):
-            origin_func = getattr(torch.nn.functional, func_name)
-            ops_dict[f'nn.functional.{func_name}'] = torch_func_wrapper(origin_func, f'nn.functional.{func_name}')
-            found = True
-
+        
         # Check in specialized submodules if not found in top-level
-        if not found:
-            special_modules = [
-                # (torch.nn.functional, 'nn.functional'),
-                (torch._C._nn, '_C._nn'), 
-                (torch._C, '_C')
-            ]
-            for module, module_name in special_modules:
-                if hasattr(module, func_name):
-                    origin_func = getattr(module, func_name)
-                    # We wrap it as torch.{func_name} for fallback logging purposes
-                    # or keep module_name in log if preferred
-                    ops_dict[f'{module_name}.{func_name}'] = torch_func_wrapper(origin_func, f'{module_name}.{func_name}')
-                    found = True
-                    break
+
+        special_modules = [
+            (torch.nn.functional, 'nn.functional'),
+            (torch._C._nn, '_C._nn'), 
+            (torch._C, '_C')
+        ]
+        for module, module_name in special_modules:
+            if hasattr(module, func_name):
+                origin_func = getattr(module, func_name)
+                # We wrap it as torch.{func_name} for fallback logging purposes
+                # or keep module_name in log if preferred
+                ops_dict[f'{module_name}.{func_name}'] = torch_func_wrapper(origin_func, f'{module_name}.{func_name}')
+                found = True
+                break
 
         if not found:
             missing_ops.append(func_name)
